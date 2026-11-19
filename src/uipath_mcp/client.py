@@ -397,6 +397,30 @@ class UiPathClient:
         response = await self._request("GET", url, params=params)
         return response.json()
 
+    async def api_get_raw(
+        self,
+        path: str,
+        folder_id: int | None = None,
+    ) -> httpx.Response:
+        """Call a non-OData /api/* endpoint in a folder and return the raw response."""
+        url = self._api_url(path)
+        return await self._request("GET", url, folder_id, extra_headers={"Accept": "*/*"})
+
+    async def download(
+        self,
+        url: str,
+        headers: dict[str, str] | None = None,
+        with_auth: bool = False,
+    ) -> httpx.Response:
+        """GET an arbitrary URL (e.g. a pre-signed blob URI); adds the bearer token if asked."""
+        assert self._client is not None
+        req_headers = {"Accept": "*/*", **(headers or {})}
+        if with_auth:
+            req_headers.update(await self._auth_headers())
+        response = await self._client.get(url, headers=req_headers)
+        response.raise_for_status()
+        return response
+
     # ── Pagination ────────────────────────────────────────────────────────────
 
     async def paginate(
