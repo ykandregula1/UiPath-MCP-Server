@@ -371,14 +371,19 @@ def register(mcp: FastMCP, read_only: bool = False) -> None:
                 return json.dumps({"error": f"Job {job_key} not found in {where}"})
 
             job_folder = job.get("OrganizationUnitId") or folder_id
-            if job.get("HasVideoRecorded") is False:
-                return json.dumps(
-                    {"error": f"Job {job_key} has no video recording", "folder_id": job_folder}
+            # Don't trust HasVideoRecorded alone; ask the recording endpoint and report both.
+            try:
+                resp = await st.client.api_get_raw(
+                    f"api/VideoRecording/jobs/{job_key}/read", folder_id=job_folder
                 )
-
-            resp = await st.client.api_get_raw(
-                f"api/VideoRecording/jobs/{job_key}/read", folder_id=job_folder
-            )
+            except UiPathError as e:
+                if e.status_code != 404:
+                    raise
+                return json.dumps({
+                    "error": f"No recording available for job {job_key}",
+                    "has_video_recorded": job.get("HasVideoRecorded"),
+                    "folder_id": job_folder,
+                })
             # Orchestrator returns a list of pre-signed read descriptors, one per stored
             # file (metadata.json, recording.webm, thumbnail.png):
             #   [{"uri": ..., "verb": "GET", "requiresAuth": false,
@@ -390,9 +395,11 @@ def register(mcp: FastMCP, read_only: bool = False) -> None:
                 None,
             )
             if not video_desc:
-                return json.dumps(
-                    {"error": "No recording file in VideoRecording response", "files": names}
-                )
+                return json.dumps({
+                    "error": "No recording file in VideoRecording response",
+                    "files": names,
+                    "has_video_recorded": job.get("HasVideoRecorded"),
+                })
 
             hdrs = video_desc.get("headers") or {}
             extra = dict(zip(hdrs.get("keys") or [], hdrs.get("values") or [], strict=False))

@@ -324,11 +324,23 @@ class TestGetJobRecording:
     async def test_reports_job_without_recording(self, pat_settings, tmp_path):
         client = AsyncMock()
         client.get_action = AsyncMock(return_value=self._job(has_video=False))
+        client.api_get_raw = AsyncMock(side_effect=UiPathError("nf", status_code=404))
         result = json.loads(await self._tool()(
             ctx=make_mock_ctx(client, pat_settings), job_key=self.JOB_KEY,
             folder_id=1333964, output_dir=str(tmp_path)))
-        assert "no video recording" in result["error"]
-        client.api_get_raw.assert_not_called()
+        assert "No recording available" in result["error"]
+        assert result["has_video_recorded"] is False
+        client.download.assert_not_called()
+
+    async def test_tries_endpoint_even_when_flag_is_false(self, pat_settings, tmp_path):
+        client = AsyncMock()
+        client.get_action = AsyncMock(return_value=self._job(has_video=False))
+        client.api_get_raw = AsyncMock(return_value=self._resp(None, json_body=self._descriptors()))
+        client.download = AsyncMock(return_value=self._resp("video/webm", self.WEBM))
+        result = json.loads(await self._tool()(
+            ctx=make_mock_ctx(client, pat_settings), job_key=self.JOB_KEY,
+            folder_id=1333964, output_dir=str(tmp_path)))
+        assert result["file_path"].endswith(".webm")
 
     async def test_rejects_non_guid_key(self, pat_settings):
         client = AsyncMock()
