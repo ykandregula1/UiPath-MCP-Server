@@ -1,17 +1,23 @@
 """
-Job management tools — 12 tools.
+Job management tools — 13 tools.
 
   list_jobs          list_running_jobs  list_failed_jobs  list_jobs_by_process
   get_job            get_job_output     get_job_statistics get_job_logs
   start_job          stop_job           bulk_stop_jobs     wait_for_job  ⭐new
+  get_job_recording
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import tempfile
+import uuid
+from pathlib import Path, PurePosixPath
 from typing import Annotated, Any
+from urllib.parse import urlsplit
 
+import httpx
 from mcp.server.fastmcp import Context, FastMCP
 from pydantic import Field
 
@@ -305,6 +311,127 @@ def register(mcp: FastMCP, read_only: bool = False) -> None:
             return json.dumps({"count": len(logs), "logs": logs}, default=str)
         except UiPathError as e:
             return json.dumps(e.to_dict())
+
+    # ── get_job_recording ─────────────────────────────────────────────────────
+
+    @mcp.tool()
+    async def get_job_recording(
+        ctx: Context,
+        job_key: Annotated[str, Field(description="Job Key (GUID, not numeric ID)")],
+        folder_id: Annotated[
+            int | None,
+            Field(description="Folder ID of the job. If omitted, all folders are searched."),
+        ] = None,
+        output_dir: Annotated[
+            str | None,
+            Field(description="Where to save the video. Default: <temp>/uipath_recordings"),
+        ] = None,
+    ) -> str:
+        """
+        Download the video recording of a job and save it to a local file.
+        Finds the job's own folder first (the Orchestrator UI can send the wrong folder
+        and fail with 'Specified job does not exist'), then fetches the recording there.
+        Returns the saved file path — not the video itself.
+        """
+        st = _state(ctx)
+        try:
+            job_key = str(uuid.UUID(job_key))
+        except ValueError:
+            return json.dumps({"error": f"'{job_key}' is not a valid job Key GUID"})
+
+        async def find_in(fid: int | None) -> dict[str, Any] | None:
+            # Same lookup the Orchestrator UI uses; `Key eq guid'...'` is rejected by OData v4.
+            try:
+                return await st.client.get_action(
+                    "Jobs", f"GetByKey(identifier={job_key})", folder_id=fid
+                )
+            except UiPathError as e:
+                if e.status_code in (403, 404):
+                    return None  # no access to / not in this folder
+                raise
+
+        try:
+            if folder_id is not None:
+                job = await find_in(folder_id)
+            else:
+                folders = await st.client.collect_all(
+                    "Folders", params=ODataParams().select("Id").build()
+                )
+                sem = asyncio.Semaphore(8)
+
+                async def guarded(fid: int) -> dict[str, Any] | None:
+                    async with sem:
+                        return await find_in(fid)
+
+                hits = await asyncio.gather(*[guarded(f["Id"]) for f in folders])
+                job = next((h for h in hits if h), None)
+
+            if not job:
+                where = f"folder {folder_id}" if folder_id is not None else "any accessible folder"
+                return json.dumps({"error": f"Job {job_key} not found in {where}"})
+
+            job_folder = job.get("OrganizationUnitId") or folder_id
+            # Don't trust HasVideoRecorded alone; ask the recording endpoint and report both.
+            try:
+                resp = await st.client.api_get_raw(
+                    f"api/VideoRecording/jobs/{job_key}/read", folder_id=job_folder
+                )
+            except UiPathError as e:
+                if e.status_code != 404:
+                    raise
+                return json.dumps({
+                    "error": f"No recording available for job {job_key}",
+                    "has_video_recorded": job.get("HasVideoRecorded"),
+                    "folder_id": job_folder,
+                })
+            # Orchestrator returns a list of pre-signed read descriptors, one per stored
+            # file (metadata.json, recording.webm, thumbnail.png):
+            #   [{"uri": ..., "verb": "GET", "requiresAuth": false,
+            #     "headers": {"keys": [...] | null, "values": [...] | null}}, ...]
+            descriptors = resp.json()
+            names = [PurePosixPath(urlsplit(d["uri"]).path).name for d in descriptors]
+            video_desc = next(
+                (d for d, n in zip(descriptors, names, strict=True) if n.startswith("recording.")),
+                None,
+            )
+            if not video_desc:
+                return json.dumps({
+                    "error": "No recording file in VideoRecording response",
+                    "files": names,
+                    "has_video_recorded": job.get("HasVideoRecorded"),
+                })
+
+            hdrs = video_desc.get("headers") or {}
+            extra = dict(zip(hdrs.get("keys") or [], hdrs.get("values") or [], strict=False))
+            video = await st.client.download(
+                video_desc["uri"], headers=extra, with_auth=bool(video_desc.get("requiresAuth"))
+            )
+            body = video.content
+
+            ext = PurePosixPath(urlsplit(video_desc["uri"]).path).suffix or ".bin"
+            out = Path(output_dir or Path(tempfile.gettempdir()) / "uipath_recordings")
+            out.mkdir(parents=True, exist_ok=True)
+            path = out / f"{job_key}{ext}"
+            path.write_bytes(body)
+            content_type = video.headers.get("content-type", "").split(";")[0].strip()
+
+            return json.dumps(
+                {
+                    "job_key": job_key,
+                    "process": job.get("ReleaseName"),
+                    "state": job.get("State"),
+                    "folder_id": job_folder,
+                    "folder_name": job.get("OrganizationUnitFullyQualifiedName"),
+                    "file_path": str(path),
+                    "size_bytes": len(body),
+                    "content_type": content_type or None,
+                },
+                default=str,
+            )
+        except UiPathError as e:
+            return json.dumps(e.to_dict())
+        except httpx.HTTPError as e:
+            return json.dumps({"error": f"Failed to download recording: {type(e).__name__}"})
 
     # ── start_job / stop_job / bulk_stop_jobs (write — omitted in read_only mode) ─
 
